@@ -66,6 +66,54 @@ def test_group_survival(ticket):
 train["GroupSurvivalRate"] = train.apply(loo_survival, axis=1)
 test["GroupSurvivalRate"]  = test["Ticket"].apply(test_group_survival)
 
+# ── 2b. Family name survival rate ─────────────────────────────────────────────
+# Passengers sharing a last name have correlated survival even across tickets.
+# This extends coverage to family members who booked separately.
+
+train["LastName"] = train["Name"].str.split(",").str[0].str.strip()
+test["LastName"]  = test["Name"].str.split(",").str[0].str.strip()
+
+name_stats = (
+    train.groupby("LastName")["Survived"]
+    .agg(survived_sum="sum", total="count")
+)
+
+
+def loo_name_survival(row):
+    """Leave-one-out family-name survival rate for a train passenger."""
+    n = row["LastName"]
+    if n not in name_stats.index or name_stats.loc[n, "total"] < 2:
+        return -1.0
+    s = name_stats.loc[n, "survived_sum"] - row["Survived"]
+    cnt = name_stats.loc[n, "total"] - 1
+    return s / cnt
+
+
+def test_name_survival(last_name):
+    """Family-name survival rate for a test passenger."""
+    if last_name not in name_stats.index:
+        return -1.0
+    return name_stats.loc[last_name, "survived_sum"] / name_stats.loc[last_name, "total"]
+
+
+train["FamilyNameSurvivalRate"] = train.apply(loo_name_survival, axis=1)
+test["FamilyNameSurvivalRate"]  = test["LastName"].apply(test_name_survival)
+
+# Combined: take whichever signal is available (ticket > name > -1)
+def combine_survival_rates(ticket_rate, name_rate):
+    if ticket_rate != -1.0:
+        return ticket_rate          # ticket is more specific
+    return name_rate                # fall back to family name
+
+train["BestGroupRate"] = [
+    combine_survival_rates(t, n)
+    for t, n in zip(train["GroupSurvivalRate"], train["FamilyNameSurvivalRate"])
+]
+test["BestGroupRate"] = [
+    combine_survival_rates(t, n)
+    for t, n in zip(test["GroupSurvivalRate"], test["FamilyNameSurvivalRate"])
+]
+
 # ── 3. Feature engineering ────────────────────────────────────────────────────
 
 all_tickets       = pd.concat([train["Ticket"], test["Ticket"]])
@@ -143,7 +191,9 @@ FEATURES = [
     "Embarked", "Title", "FamilySize", "FamilyGroup", "IsAlone",
     "TicketGroupSize", "FareBand", "AgeBand", "HasCabin", "Deck",
     "IsChild", "IsWomanOrChild", "Sex_Pclass",
-    "GroupSurvivalRate",           # ← new: ticket-mate survival signal
+    "GroupSurvivalRate",        # ticket-mate survival signal
+    "FamilyNameSurvivalRate",   # name-based family survival signal
+    "BestGroupRate",            # combined: ticket first, then name
 ]
 
 X      = train[FEATURES]
@@ -152,8 +202,10 @@ X_test = test[FEATURES]
 
 print(f"Features used ({len(FEATURES)}): {FEATURES}")
 print(f"X shape: {X.shape}  |  Missing values: {X.isnull().sum().sum()}")
-coverage = (train["GroupSurvivalRate"] != -1).mean()
-print(f"GroupSurvivalRate coverage (train): {coverage:.1%}")
+ticket_cov = (train["GroupSurvivalRate"] != -1).mean()
+name_cov   = (train["FamilyNameSurvivalRate"] != -1).mean()
+best_cov   = (train["BestGroupRate"] != -1).mean()
+print(f"Coverage — ticket: {ticket_cov:.1%}  name: {name_cov:.1%}  combined: {best_cov:.1%}")
 
 # ── 4. Base models ────────────────────────────────────────────────────────────
 
