@@ -1,12 +1,13 @@
 """
 Kaggle Titanic - Machine Learning from Disaster
-Full ML pipeline: feature engineering + stacking ensemble → submission.csv
+Full ML pipeline: feature engineering + soft-voting ensemble → submission
 
 Usage:
     python titanic_solution.py
 
-Expects train.csv and test.csv in the same directory.
-Outputs submission.csv ready for Kaggle upload.
+Reads:  /kaggle/input/titanic/train.csv
+        /kaggle/input/titanic/test.csv
+Writes: /kaggle/working/gender_submission.csv
 """
 
 import warnings
@@ -27,8 +28,8 @@ from lightgbm import LGBMClassifier
 
 # ── 1. Load data ──────────────────────────────────────────────────────────────
 
-train = pd.read_csv("train.csv")
-test  = pd.read_csv("test.csv")
+train = pd.read_csv("/kaggle/input/titanic/train.csv")
+test  = pd.read_csv("/kaggle/input/titanic/test.csv")
 
 print(f"Train shape: {train.shape}  |  Test shape: {test.shape}")
 
@@ -280,11 +281,11 @@ submission = pd.DataFrame({
     "PassengerId": test["PassengerId"],
     "Survived":    preds.astype(int),
 })
-submission.to_csv("submission.csv", index=False)
+submission.to_csv("/kaggle/working/gender_submission.csv", index=False)
 
-print(f"\nSubmission saved: submission.csv  ({len(submission)} rows)  [model: Soft Voting]")
+print(f"\nSubmission saved: /kaggle/working/gender_submission.csv  ({len(submission)} rows)  [model: Soft Voting]")
 print(f"Predicted survivors: {preds.sum()} / {len(preds)}  "
       f"({preds.mean()*100:.1f}%)")
 print("\nFirst 10 predictions:")
 print(submission.head(10).to_string(index=False))
-print("\nDone! Upload submission.csv to Kaggle.")
+print("\nDone! Submit /kaggle/working/gender_submission.csv to Kaggle.")
