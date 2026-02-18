@@ -26,6 +26,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 # ── 1. Load data ──────────────────────────────────────────────────────────────
 
@@ -34,10 +35,40 @@ test  = pd.read_csv("test.csv")
 
 print(f"Train shape: {train.shape}  |  Test shape: {test.shape}")
 
-# ── 2. Feature engineering ────────────────────────────────────────────────────
+# ── 2. Group survival rate (computed on raw data before feature engineering) ──
+# For each passenger, what fraction of their ticket-mates survived?
+# Train: leave-one-out to avoid label leakage within cross-validation.
+# Test:  use all known train companions (no leakage risk).
 
-# Precompute ticket group sizes across both sets (avoids leakage in counts)
-all_tickets = pd.concat([train["Ticket"], test["Ticket"]])
+ticket_stats = (
+    train.groupby("Ticket")["Survived"]
+    .agg(survived_sum="sum", total="count")
+)
+
+
+def loo_survival(row):
+    """Leave-one-out group survival rate for a train passenger."""
+    t = row["Ticket"]
+    if t not in ticket_stats.index or ticket_stats.loc[t, "total"] < 2:
+        return -1.0
+    s = ticket_stats.loc[t, "survived_sum"] - row["Survived"]
+    n = ticket_stats.loc[t, "total"] - 1
+    return s / n
+
+
+def test_group_survival(ticket):
+    """Group survival rate for a test passenger using full train group."""
+    if ticket not in ticket_stats.index:
+        return -1.0
+    return ticket_stats.loc[ticket, "survived_sum"] / ticket_stats.loc[ticket, "total"]
+
+
+train["GroupSurvivalRate"] = train.apply(loo_survival, axis=1)
+test["GroupSurvivalRate"]  = test["Ticket"].apply(test_group_survival)
+
+# ── 3. Feature engineering ────────────────────────────────────────────────────
+
+all_tickets       = pd.concat([train["Ticket"], test["Ticket"]])
 ticket_group_size = all_tickets.value_counts().to_dict()
 
 
@@ -57,7 +88,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Family ─────────────────────────────────────────────────────────────
     df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
-    # Small families (2-4) have highest survival; binning captures nonlinearity
     df["FamilyGroup"] = pd.cut(
         df["FamilySize"], bins=[0, 1, 4, 20],
         labels=[0, 1, 2]   # 0=alone, 1=small, 2=large
@@ -65,14 +95,12 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
 
     # ── Ticket group ───────────────────────────────────────────────────────
-    # People sharing a ticket traveled together → correlated survival
     df["TicketGroupSize"] = df["Ticket"].map(ticket_group_size).fillna(1).astype(int)
 
     # ── Fare ───────────────────────────────────────────────────────────────
     df["Fare"] = df.groupby("Pclass")["Fare"].transform(
         lambda x: x.fillna(x.median())
     )
-    # Per-person fare removes group-size effect
     df["FarePerPerson"] = df["Fare"] / df["TicketGroupSize"].clip(lower=1)
     df["FareBand"] = pd.qcut(df["Fare"], 4, labels=False, duplicates="drop")
 
@@ -101,9 +129,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Sex"] = df["Sex"].map({"male": 0, "female": 1})
 
     # ── Interaction features ───────────────────────────────────────────────
-    # Sex × Pclass is among the single strongest predictors
-    df["Sex_Pclass"] = df["Sex"] * df["Pclass"]
-    # Women/children first heuristic combined
+    df["Sex_Pclass"]     = df["Sex"] * df["Pclass"]
     df["IsWomanOrChild"] = ((df["Sex"] == 1) | (df["IsChild"] == 1)).astype(int)
 
     return df
@@ -117,6 +143,7 @@ FEATURES = [
     "Embarked", "Title", "FamilySize", "FamilyGroup", "IsAlone",
     "TicketGroupSize", "FareBand", "AgeBand", "HasCabin", "Deck",
     "IsChild", "IsWomanOrChild", "Sex_Pclass",
+    "GroupSurvivalRate",           # ← new: ticket-mate survival signal
 ]
 
 X      = train[FEATURES]
@@ -125,55 +152,41 @@ X_test = test[FEATURES]
 
 print(f"Features used ({len(FEATURES)}): {FEATURES}")
 print(f"X shape: {X.shape}  |  Missing values: {X.isnull().sum().sum()}")
+coverage = (train["GroupSurvivalRate"] != -1).mean()
+print(f"GroupSurvivalRate coverage (train): {coverage:.1%}")
 
-# ── 3. Base models ────────────────────────────────────────────────────────────
+# ── 4. Base models ────────────────────────────────────────────────────────────
 
 rf = RandomForestClassifier(
-    n_estimators=500,
-    max_depth=6,
-    min_samples_split=12,
-    min_samples_leaf=4,
-    max_features="sqrt",
-    random_state=42,
-    n_jobs=-1,
+    n_estimators=500, max_depth=6, min_samples_split=12,
+    min_samples_leaf=4, max_features="sqrt", random_state=42, n_jobs=-1,
 )
 
 et = ExtraTreesClassifier(
-    n_estimators=500,
-    max_depth=7,
-    min_samples_split=12,
-    min_samples_leaf=4,
-    max_features="sqrt",
-    random_state=42,
-    n_jobs=-1,
+    n_estimators=500, max_depth=7, min_samples_split=12,
+    min_samples_leaf=4, max_features="sqrt", random_state=42, n_jobs=-1,
 )
 
 xgb = XGBClassifier(
-    n_estimators=500,
-    max_depth=4,
-    learning_rate=0.03,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=0.1,
-    reg_lambda=1.0,
-    use_label_encoder=False,
-    eval_metric="logloss",
-    random_state=42,
-    verbosity=0,
+    n_estimators=500, max_depth=4, learning_rate=0.03,
+    subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+    use_label_encoder=False, eval_metric="logloss",
+    random_state=42, verbosity=0,
+)
+
+lgbm = LGBMClassifier(
+    n_estimators=500, max_depth=4, learning_rate=0.03,
+    subsample=0.8, colsample_bytree=0.8,
+    reg_alpha=0.1, reg_lambda=1.0,
+    random_state=42, verbose=-1, n_jobs=-1,
 )
 
 gb = GradientBoostingClassifier(
-    n_estimators=300,
-    max_depth=3,
-    learning_rate=0.05,
-    subsample=0.8,
-    min_samples_leaf=6,
-    random_state=42,
+    n_estimators=300, max_depth=3, learning_rate=0.05,
+    subsample=0.8, min_samples_leaf=6, random_state=42,
 )
 
-# ── 4. Stacking ensemble ──────────────────────────────────────────────────────
-# Stacking uses out-of-fold predictions from base models as meta-features,
-# reducing overfitting vs. simple voting.
+# ── 5. Stacking ensemble ──────────────────────────────────────────────────────
 
 meta_lr = Pipeline([
     ("scaler", StandardScaler()),
@@ -181,32 +194,30 @@ meta_lr = Pipeline([
 ])
 
 stacking = StackingClassifier(
-    estimators=[("rf", rf), ("et", et), ("xgb", xgb), ("gb", gb)],
+    estimators=[("rf", rf), ("et", et), ("xgb", xgb), ("lgbm", lgbm), ("gb", gb)],
     final_estimator=meta_lr,
     cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
     passthrough=False,
     n_jobs=-1,
 )
 
-# ── 5. Cross-validation ───────────────────────────────────────────────────────
+# ── 6. Cross-validation ───────────────────────────────────────────────────────
 
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 print("\n── Cross-validation (5-fold accuracy) ──")
 for name, model in [
     ("Random Forest", rf), ("Extra Trees", et),
-    ("XGBoost", xgb), ("Gradient Boosting", gb),
-    ("Stacking", stacking),
+    ("XGBoost", xgb), ("LightGBM", lgbm),
+    ("Gradient Boosting", gb), ("Stacking", stacking),
 ]:
     scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
     print(f"  {name:<20} {scores.mean():.4f} ± {scores.std():.4f}")
 
-# ── 6. Train final model on all training data ─────────────────────────────────
+# ── 7. Train final model & generate submission ────────────────────────────────
 
 print("\nTraining stacking ensemble on full training set...")
 stacking.fit(X, y)
-
-# ── 7. Generate predictions & submission file ─────────────────────────────────
 
 preds = stacking.predict(X_test)
 
