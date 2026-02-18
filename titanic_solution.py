@@ -18,13 +18,10 @@ import pandas as pd
 from sklearn.ensemble import (
     RandomForestClassifier,
     GradientBoostingClassifier,
-    StackingClassifier,
     ExtraTreesClassifier,
+    VotingClassifier,
 )
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
@@ -206,6 +203,11 @@ ticket_cov = (train["GroupSurvivalRate"] != -1).mean()
 name_cov   = (train["FamilyNameSurvivalRate"] != -1).mean()
 best_cov   = (train["BestGroupRate"] != -1).mean()
 print(f"Coverage — ticket: {ticket_cov:.1%}  name: {name_cov:.1%}  combined: {best_cov:.1%}")
+# Print test-set coverage too
+t_ticket = (test["GroupSurvivalRate"] != -1).mean()
+t_name   = (test["FamilyNameSurvivalRate"] != -1).mean()
+t_best   = (test["BestGroupRate"] != -1).mean()
+print(f"Test coverage — ticket: {t_ticket:.1%}  name: {t_name:.1%}  combined: {t_best:.1%}")
 
 # ── 4. Base models ────────────────────────────────────────────────────────────
 
@@ -238,18 +240,13 @@ gb = GradientBoostingClassifier(
     subsample=0.8, min_samples_leaf=6, random_state=42,
 )
 
-# ── 5. Stacking ensemble ──────────────────────────────────────────────────────
+# ── 5. Soft-voting ensemble ───────────────────────────────────────────────────
+# Average the class probabilities from the four strongest individual models.
+# This outperforms stacking on small datasets (less meta-overfitting).
 
-meta_lr = Pipeline([
-    ("scaler", StandardScaler()),
-    ("clf", LogisticRegression(C=0.5, max_iter=1000, random_state=42)),
-])
-
-stacking = StackingClassifier(
-    estimators=[("rf", rf), ("et", et), ("xgb", xgb), ("lgbm", lgbm), ("gb", gb)],
-    final_estimator=meta_lr,
-    cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
-    passthrough=False,
+voting = VotingClassifier(
+    estimators=[("xgb", xgb), ("lgbm", lgbm), ("gb", gb), ("rf", rf)],
+    voting="soft",
     n_jobs=-1,
 )
 
@@ -258,20 +255,26 @@ stacking = StackingClassifier(
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 print("\n── Cross-validation (5-fold accuracy) ──")
-for name, model in [
+cv_results = {}
+for label, model in [
     ("Random Forest", rf), ("Extra Trees", et),
     ("XGBoost", xgb), ("LightGBM", lgbm),
-    ("Gradient Boosting", gb), ("Stacking", stacking),
+    ("Gradient Boosting", gb), ("Soft Voting", voting),
 ]:
     scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
-    print(f"  {name:<20} {scores.mean():.4f} ± {scores.std():.4f}")
+    cv_results[label] = scores.mean()
+    print(f"  {label:<20} {scores.mean():.4f} ± {scores.std():.4f}")
+
+best_label = max(cv_results, key=cv_results.get)
+print(f"\nBest CV model: {best_label}  ({cv_results[best_label]:.4f})")
 
 # ── 7. Train final model & generate submission ────────────────────────────────
+# Always use Soft Voting for the submission (best ensemble generalization).
 
-print("\nTraining stacking ensemble on full training set...")
-stacking.fit(X, y)
+print("\nTraining soft-voting ensemble on full training set...")
+voting.fit(X, y)
 
-preds = stacking.predict(X_test)
+preds = voting.predict(X_test)
 
 submission = pd.DataFrame({
     "PassengerId": test["PassengerId"],
@@ -279,7 +282,7 @@ submission = pd.DataFrame({
 })
 submission.to_csv("submission.csv", index=False)
 
-print(f"\nSubmission saved: submission.csv  ({len(submission)} rows)")
+print(f"\nSubmission saved: submission.csv  ({len(submission)} rows)  [model: Soft Voting]")
 print(f"Predicted survivors: {preds.sum()} / {len(preds)}  "
       f"({preds.mean()*100:.1f}%)")
 print("\nFirst 10 predictions:")
