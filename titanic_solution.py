@@ -189,9 +189,10 @@ FEATURES = [
     "Embarked", "Title", "FamilySize", "FamilyGroup", "IsAlone",
     "TicketGroupSize", "FareBand", "AgeBand", "HasCabin", "Deck",
     "IsChild", "IsWomanOrChild", "Sex_Pclass",
-    "GroupSurvivalRate",        # ticket-mate survival signal
-    "FamilyNameSurvivalRate",   # name-based family survival signal
-    "BestGroupRate",            # combined: ticket first, then name
+    # GroupSurvivalRate / FamilyNameSurvivalRate / BestGroupRate removed:
+    # they are computed from the full training set before CV, so the LOO
+    # trick does not prevent leakage across folds → inflated CV (~+8 pts)
+    # and poor LB generalisation.
 ]
 
 X      = train[FEATURES]
@@ -200,15 +201,6 @@ X_test = test[FEATURES]
 
 print(f"Features used ({len(FEATURES)}): {FEATURES}")
 print(f"X shape: {X.shape}  |  Missing values: {X.isnull().sum().sum()}")
-ticket_cov = (train["GroupSurvivalRate"] != -1).mean()
-name_cov   = (train["FamilyNameSurvivalRate"] != -1).mean()
-best_cov   = (train["BestGroupRate"] != -1).mean()
-print(f"Coverage — ticket: {ticket_cov:.1%}  name: {name_cov:.1%}  combined: {best_cov:.1%}")
-# Print test-set coverage too
-t_ticket = (test["GroupSurvivalRate"] != -1).mean()
-t_name   = (test["FamilyNameSurvivalRate"] != -1).mean()
-t_best   = (test["BestGroupRate"] != -1).mean()
-print(f"Test coverage — ticket: {t_ticket:.1%}  name: {t_name:.1%}  combined: {t_best:.1%}")
 
 # ── 4. Base models ────────────────────────────────────────────────────────────
 
